@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>Bam.Ssh.Tests</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\..\bam.console\bam.console\bam.console.csproj" />
+      <ProjectReference Include="..\..\bam.test\bam.test\bam.test.csproj" />
+      <ProjectReference Include="..\bam.ssh.common\bam.ssh.common.csproj" />
+      <ProjectReference Include="..\bam.ssh.transport\bam.ssh.transport.csproj" />
+      <ProjectReference Include="..\bam.ssh.authentication\bam.ssh.authentication.csproj" />
+      <ProjectReference Include="..\bam.ssh.connection\bam.ssh.connection.csproj" />
+      <ProjectReference Include="..\bam.ssh.terminal\bam.ssh.terminal.csproj" />
+      <ProjectReference Include="..\bam.ssh.sftp\bam.ssh.sftp.csproj" />
+      <ProjectReference Include="..\bam.ssh.scp\bam.ssh.scp.csproj" />
+      <ProjectReference Include="..\bam.ssh.client\bam.ssh.client.csproj" />
+      <ProjectReference Include="..\bam.ssh.server\bam.ssh.server.csproj" />
+    </ItemGroup>
+
+</Project>
