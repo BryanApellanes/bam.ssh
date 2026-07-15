@@ -6,8 +6,8 @@ Running implementation plan. Updated continuously as phases complete. Each phase
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | Repo scaffold, bamtk submodule registration, epic + board wiring | In progress |
-| 1 | Packet layer: binary encoding (RFC 4251), packet framing (RFC 4253 §6), sequence numbers, buffer pooling | Not started |
+| 0 | Repo scaffold, bamtk submodule registration, epic + board wiring | **Complete** (bamtk PR [#22](https://github.com/BryanApellanes/bamtk/pull/22)) |
+| 1 | Packet layer: binary encoding (RFC 4251), packet framing (RFC 4253 §6), sequence numbers, buffer pooling | **Complete** — 18 types in `bam.ssh.common`, 23 tests, walkthrough in [docs/protocol/packet-layer.md](protocol/packet-layer.md) |
 | 2 | Transport: version exchange, banner, packet pipeline, disconnect/ignore/debug | Not started |
 | 3 | Key exchange: curve25519-sha256, ecdh-sha2-nistp256, dh-group14-sha256; KEXINIT negotiation; exchange hash; key derivation | Not started |
 | 4 | Encryption: chacha20-poly1305@openssh.com, aes256-gcm@openssh.com, aes128-gcm@openssh.com, aes*-ctr + HMAC-SHA2; rekeying | Not started |
