@@ -37,3 +37,15 @@ Records *why* decisions were made, not just what they are. Append-only; newest e
 **Date:** 2026-07-15
 **Decision:** The transport advertises and accepts only `none` compression initially. The negotiation and packet pipeline include the seam for `zlib`/`zlib@openssh.com` (payload transform between framing and encryption), but no compressor ships until a later pass.
 **Why:** Compression is optional in RFC 4253, rarely beneficial on modern links, and `zlib@openssh.com` (delayed compression) adds auth-state coupling. Deferring it keeps Phase 2–4 focused; the seam prevents a later retrofit.
+
+## D-007: `System.Diagnostics.DiagnosticSource` (ActivitySource) is the one non-BCL-core assembly admitted to the core libraries
+
+**Date:** 2026-07-15
+**Decision:** The core libraries stay dependency-free (D-001) with a single exception: `System.Diagnostics.DiagnosticSource`, used for `ActivitySource`/`Activity` tracing spans (`SshActivitySource` in `bam.ssh.common`). Logging uses the framework-free `ISshLogger` seam instead of any logging package.
+**Why:** The directive explicitly requires `ActivitySource` and OpenTelemetry support. `System.Diagnostics.DiagnosticSource` ships in the .NET shared framework, is trim/AOT-annotated by Microsoft, and needs no `PackageReference` (it resolved at build with `IsAotCompatible`/`TreatWarningsAsErrors` on and zero warnings). Re-implementing tracing would be strictly worse than consuming the first-party, AOT-safe primitive. A logging *framework* (e.g. bamtk `bam.logging`) would break AOT/portability, so logging is abstracted behind `ISshLogger` and adapted only in the future client/server composition roots.
+
+## D-008: Cipher applied around framing via a per-direction `ISshPacketCipher`; sequence numbers owned by the reader/writer, not the codec
+
+**Date:** 2026-07-15
+**Decision:** Encryption/MAC is a per-direction seam (`ISshPacketCipher`) that the Phase 2 `SshPacketWriter`/`SshPacketReader` apply around the Phase 1 encoder/decoder. `NonePacketCipher` is the cleartext identity used before key exchange. The seam exposes `Geometry` (drives padding), `MacLength`, `LengthPeekSize`, `TransformOutgoing`, `DecryptLength`, and `VerifyAndDecrypt` — enough for Phase 4's chacha20-poly1305 (encrypted length, 16-byte tag), AES-GCM (cleartext length, 16-byte tag), and AES-CTR+HMAC (cleartext length, separate MAC) without touching the send/receive loop. The send/receive `SshSequenceNumber` lives in the writer/reader (not the Phase 1 codec) because the MAC binds the sequence number to cipher state.
+**Why:** Keeps framing, ciphering, and orchestration at one responsibility each and makes the Phase 4 swap a field assignment (`SwapCipher`/`ApplyKeys`) rather than a rewrite. The returned `SshIncomingPacket` owns a pooled copy of the payload (via the Phase 1 `SshRentedBuffer`) because the decoder's slice is only valid until the pipe advances — pooled, not `new byte[]`, to hold the near-zero-allocation line.
