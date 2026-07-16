@@ -149,7 +149,16 @@ internal sealed class TestServerKeyExchange
 
     public byte[]? ExchangeHash { get; private set; }
 
-    public async Task RunAsync(CancellationToken cancellationToken = default)
+    public SshNegotiatedAlgorithms Algorithms { get; private set; }
+
+    /// <summary>
+    /// Runs the server role of the exchange. When <paramref name="preservedSessionId"/> is supplied
+    /// (a rekey), it is used as the session id for key derivation instead of this exchange's hash;
+    /// when null (the first exchange) the session id is the exchange hash. On completion the server's
+    /// transport ciphers are activated (server role: inbound is client-to-server, outbound is
+    /// server-to-client), mirroring the client's <c>ApplyKeys</c>.
+    /// </summary>
+    public async Task RunAsync(byte[]? preservedSessionId = null, CancellationToken cancellationToken = default)
     {
         SshVersionExchangeResult version = _transport.VersionExchange;
 
@@ -160,6 +169,7 @@ internal sealed class TestServerKeyExchange
 
         SshNegotiatedAlgorithms algorithms = SshAlgorithmNegotiation.Negotiate(
             SshKexInit.Parse(clientKexInit), SshKexInit.Parse(serverKexInit));
+        Algorithms = algorithms;
         ISshKeyExchangeAlgorithm algorithm = SshKeyExchangeAlgorithmFactory.Create(algorithms.KeyExchange);
 
         byte[] initPayload = await ReceiveAsync(SshMessageNumber.KexExchangeSpecific30, cancellationToken).ConfigureAwait(false);
@@ -192,15 +202,26 @@ internal sealed class TestServerKeyExchange
         await ReceiveAsync(SshMessageNumber.NewKeys, cancellationToken).ConfigureAwait(false);
         await _transport.SendPacketAsync(new byte[] { (byte)SshMessageNumber.NewKeys }, cancellationToken).ConfigureAwait(false);
 
+        byte[] sessionId = preservedSessionId ?? exchangeHash;
         ExchangeHash = exchangeHash;
-        SessionKeys = new SshSessionKeys(
-            exchangeHash,
-            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.InitialIvClientToServer, exchangeHash, 64),
-            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.InitialIvServerToClient, exchangeHash, 64),
-            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.EncryptionKeyClientToServer, exchangeHash, 64),
-            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.EncryptionKeyServerToClient, exchangeHash, 64),
-            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.IntegrityKeyClientToServer, exchangeHash, 64),
-            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.IntegrityKeyServerToClient, exchangeHash, 64));
+        SshSessionKeys keys = new SshSessionKeys(
+            sessionId,
+            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.InitialIvClientToServer, sessionId, 64),
+            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.InitialIvServerToClient, sessionId, 64),
+            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.EncryptionKeyClientToServer, sessionId, 64),
+            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.EncryptionKeyServerToClient, sessionId, 64),
+            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.IntegrityKeyClientToServer, sessionId, 64),
+            SshKeyDerivation.DeriveKey(algorithm.HashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.IntegrityKeyServerToClient, sessionId, 64));
+        SessionKeys = keys;
+
+        // Server role: inbound = client-to-server, outbound = server-to-client.
+        ISshPacketCipher inbound = SshCipherFactory.Create(
+            algorithms.EncryptionClientToServer, algorithms.MacClientToServer,
+            keys.EncryptionKeyClientToServer, keys.InitialIvClientToServer, keys.IntegrityKeyClientToServer);
+        ISshPacketCipher outbound = SshCipherFactory.Create(
+            algorithms.EncryptionServerToClient, algorithms.MacServerToClient,
+            keys.EncryptionKeyServerToClient, keys.InitialIvServerToClient, keys.IntegrityKeyServerToClient);
+        _transport.ApplyKeys(inbound, outbound);
     }
 
     private async Task<byte[]> ReceiveAsync(SshMessageNumber expected, CancellationToken cancellationToken)

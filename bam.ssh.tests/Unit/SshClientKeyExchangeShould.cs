@@ -76,7 +76,7 @@ public class SshClientKeyExchangeShould : UnitTestMenuContainer
                     TestServerKeyExchange serverKex = new TestServerKeyExchange(server, hostKeyBlob, sign, corruptSignature: true);
 
                     Task<SshKeyExchangeResult> clientTask = clientKex.PerformAsync().AsTask();
-                    Task serverTask = serverKex.RunAsync(serverCancellation.Token);
+                    Task serverTask = serverKex.RunAsync(null, serverCancellation.Token);
 
                     try
                     {

@@ -45,12 +45,35 @@ public sealed class SshClientKeyExchange
     }
 
     /// <summary>
-    /// Performs the full client-side key exchange.
+    /// Performs the full client-side initial key exchange and activates the negotiated ciphers on the
+    /// transport. The session identifier is the exchange hash of this first exchange.
     /// </summary>
     /// <param name="cancellationToken">Cancels the exchange.</param>
     /// <returns>The negotiated algorithms, verified host key, and derived session keys.</returns>
     /// <exception cref="SshKeyExchangeException">Negotiation failed, a message was malformed, or the host-key signature did not verify.</exception>
-    public async ValueTask<SshKeyExchangeResult> PerformAsync(CancellationToken cancellationToken = default)
+    public ValueTask<SshKeyExchangeResult> PerformAsync(CancellationToken cancellationToken = default)
+    {
+        return ExecuteAsync(existingSessionId: null, cancellationToken);
+    }
+
+    /// <summary>
+    /// Re-runs key exchange on an established connection (RFC 4253 §9 rekeying), deriving fresh keys
+    /// and swapping in new ciphers while preserving the original session identifier. The caller (the
+    /// connection layer) is responsible for deciding <em>when</em> to rekey and for not interleaving
+    /// application data with the rekey exchange.
+    /// </summary>
+    /// <param name="sessionId">The session identifier established by the first exchange.</param>
+    /// <param name="cancellationToken">Cancels the exchange.</param>
+    /// <returns>The renegotiated algorithms, verified host key, and freshly derived session keys.</returns>
+    /// <exception cref="ArgumentNullException">The session id is null.</exception>
+    /// <exception cref="SshKeyExchangeException">Negotiation failed, a message was malformed, or the host-key signature did not verify.</exception>
+    public ValueTask<SshKeyExchangeResult> RekeyAsync(byte[] sessionId, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(sessionId);
+        return ExecuteAsync(sessionId, cancellationToken);
+    }
+
+    private async ValueTask<SshKeyExchangeResult> ExecuteAsync(byte[]? existingSessionId, CancellationToken cancellationToken)
     {
         using Activity? activity = SshActivitySource.Instance.StartActivity("ssh.key_exchange");
 
@@ -98,12 +121,31 @@ public sealed class SshClientKeyExchange
 
         await ExchangeNewKeysAsync(cancellationToken).ConfigureAwait(false);
 
-        SshSessionKeys sessionKeys = DeriveSessionKeys(algorithm.HashAlgorithm, sharedSecret, exchangeHash);
+        SshSessionKeys sessionKeys = DeriveSessionKeys(algorithm.HashAlgorithm, sharedSecret, exchangeHash, existingSessionId);
+        ActivateCiphers(algorithms, sessionKeys);
         if (_logger.IsEnabled(SshLogLevel.Information))
         {
             _logger.Log(SshLogLevel.Information, "Key exchange complete; host key fingerprint {0}.", hostKey.Fingerprint);
         }
         return new SshKeyExchangeResult(algorithms, hostKey, exchangeHash, sessionKeys);
+    }
+
+    private void ActivateCiphers(SshNegotiatedAlgorithms algorithms, SshSessionKeys sessionKeys)
+    {
+        // Client role: outbound is client-to-server, inbound is server-to-client.
+        ISshPacketCipher outbound = SshCipherFactory.Create(
+            algorithms.EncryptionClientToServer,
+            algorithms.MacClientToServer,
+            sessionKeys.EncryptionKeyClientToServer,
+            sessionKeys.InitialIvClientToServer,
+            sessionKeys.IntegrityKeyClientToServer);
+        ISshPacketCipher inbound = SshCipherFactory.Create(
+            algorithms.EncryptionServerToClient,
+            algorithms.MacServerToClient,
+            sessionKeys.EncryptionKeyServerToClient,
+            sessionKeys.InitialIvServerToClient,
+            sessionKeys.IntegrityKeyServerToClient);
+        _transport.ApplyKeys(inbound, outbound);
     }
 
     private byte[] SerializeLocalKexInit()
@@ -154,10 +196,11 @@ public sealed class SshClientKeyExchange
         }
     }
 
-    private SshSessionKeys DeriveSessionKeys(System.Security.Cryptography.HashAlgorithmName hashAlgorithm, byte[] sharedSecret, byte[] exchangeHash)
+    private SshSessionKeys DeriveSessionKeys(System.Security.Cryptography.HashAlgorithmName hashAlgorithm, byte[] sharedSecret, byte[] exchangeHash, byte[]? existingSessionId)
     {
-        // First exchange: session id is the exchange hash.
-        byte[] sessionId = exchangeHash;
+        // First exchange: session id is the exchange hash. Rekey: the original session id is preserved
+        // (RFC 4253 §7.2) while the derivation still binds to the new exchange hash and shared secret.
+        byte[] sessionId = existingSessionId ?? exchangeHash;
         return new SshSessionKeys(
             sessionId,
             SshKeyDerivation.DeriveKey(hashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.InitialIvClientToServer, sessionId, DerivedKeyLength),

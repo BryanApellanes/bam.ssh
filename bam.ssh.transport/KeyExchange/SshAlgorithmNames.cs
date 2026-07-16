@@ -46,8 +46,11 @@ public static class SshAlgorithmNames
     /// <summary>aes128-gcm@openssh.com authenticated cipher (implemented in Phase 4).</summary>
     public const string Aes128Gcm = "aes128-gcm@openssh.com";
 
-    /// <summary>aes256-ctr cipher (implemented in Phase 4).</summary>
+    /// <summary>aes256-ctr cipher (RFC 4344).</summary>
     public const string Aes256Ctr = "aes256-ctr";
+
+    /// <summary>aes128-ctr cipher (RFC 4344).</summary>
+    public const string Aes128Ctr = "aes128-ctr";
 
     /// <summary>hmac-sha2-256 message authentication (implemented in Phase 4).</summary>
     public const string HmacSha2256 = "hmac-sha2-256";
