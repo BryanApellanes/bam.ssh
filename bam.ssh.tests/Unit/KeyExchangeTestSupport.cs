@@ -160,9 +160,19 @@ internal sealed class TestServerKeyExchange
     /// </summary>
     public async Task RunAsync(byte[]? preservedSessionId = null, CancellationToken cancellationToken = default)
     {
+        byte[] clientKexInit = await ReceiveAsync(SshMessageNumber.KexInit, cancellationToken).ConfigureAwait(false);
+        await RunWithClientKexInitAsync(clientKexInit, preservedSessionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs the server exchange when the caller's own receive loop has already read the client KEXINIT
+    /// (a connection-driven re-key): the supplied payload is used instead of reading one from the
+    /// transport, and the rest of the exchange proceeds normally.
+    /// </summary>
+    public async Task RunWithClientKexInitAsync(byte[] clientKexInit, byte[]? preservedSessionId, CancellationToken cancellationToken = default)
+    {
         SshVersionExchangeResult version = _transport.VersionExchange;
 
-        byte[] clientKexInit = await ReceiveAsync(SshMessageNumber.KexInit, cancellationToken).ConfigureAwait(false);
         SshKexInit serverKexInitMessage = SshKexInit.CreateLocal(SshAlgorithmCatalog.Default, SecureSshRandom.Instance);
         byte[] serverKexInit = Serialize(serverKexInitMessage);
         await _transport.SendPacketAsync(serverKexInit, cancellationToken).ConfigureAwait(false);
