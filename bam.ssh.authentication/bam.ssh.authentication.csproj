@@ -22,4 +22,10 @@
     <ProjectReference Include="..\bam.ssh.transport\bam.ssh.transport.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Ed25519 signing and Ed25519 private-key parsing (OpenSSH-v1 / PKCS#8): the BCL has no
+         Ed25519, so BouncyCastle is admitted here, mirroring the D-009 precedent in transport (D-012). -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+  </ItemGroup>
+
 </Project>
