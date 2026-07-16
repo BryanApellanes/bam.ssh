@@ -21,7 +21,7 @@ public class NonePacketCipherShould : UnitTestMenuContainer
                 bool outgoingIdentity = outgoing.WrittenSpan.SequenceEqual(framed);
 
                 Span<byte> decryptedLength = stackalloc byte[4];
-                uint length = cipher.DecryptLength(framed, decryptedLength);
+                uint length = cipher.DecryptLength(framed, 0, decryptedLength);
                 bool lengthCorrect = length == 0x0C && decryptedLength.SequenceEqual(new byte[] { 0x00, 0x00, 0x00, 0x0C });
 
                 ArrayBufferWriter<byte> incoming = new ArrayBufferWriter<byte>();

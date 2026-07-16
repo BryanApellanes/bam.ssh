@@ -45,12 +45,15 @@ public interface ISshPacketCipher
     /// <summary>
     /// Determines the cleartext packet_length from the first <see cref="LengthPeekSize"/> bytes of
     /// an incoming packet, decrypting them into <paramref name="decryptedLength"/> if the mode
-    /// encrypts the length. For the "none" cipher this reads the cleartext big-endian length.
+    /// encrypts the length. For the "none" cipher this reads the cleartext big-endian length. The
+    /// sequence number is supplied because chacha20-poly1305 keys the length cipher on it; modes with
+    /// a cleartext or counter-decrypted length ignore it.
     /// </summary>
     /// <param name="peek">The first <see cref="LengthPeekSize"/> bytes of the incoming packet.</param>
+    /// <param name="sequenceNumber">The sequence number the incoming packet will be assigned.</param>
     /// <param name="decryptedLength">Receives the four cleartext length bytes.</param>
     /// <returns>The packet_length field value.</returns>
-    uint DecryptLength(ReadOnlySpan<byte> peek, Span<byte> decryptedLength);
+    uint DecryptLength(ReadOnlySpan<byte> peek, uint sequenceNumber, Span<byte> decryptedLength);
 
     /// <summary>
     /// Authenticates and decrypts a complete incoming packet (the whole ciphertext plus its MAC)

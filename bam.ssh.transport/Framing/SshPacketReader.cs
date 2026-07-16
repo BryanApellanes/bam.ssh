@@ -90,7 +90,7 @@ public sealed class SshPacketReader
                 Span<byte> peek = stackalloc byte[lengthPeekSize];
                 buffer.Slice(0, lengthPeekSize).CopyTo(peek);
                 Span<byte> decryptedLength = stackalloc byte[4];
-                packetLength = _cipher.DecryptLength(peek, decryptedLength);
+                packetLength = _cipher.DecryptLength(peek, _sequence.Value, decryptedLength);
                 ValidatePacketLength(packetLength);
                 totalWireLength = checked(4 + (int)packetLength + macLength);
                 lengthKnown = true;

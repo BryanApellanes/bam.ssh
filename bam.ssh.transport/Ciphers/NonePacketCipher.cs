@@ -50,9 +50,10 @@ public sealed class NonePacketCipher : ISshPacketCipher
     /// Reads the cleartext big-endian packet_length from the first four bytes.
     /// </summary>
     /// <param name="peek">The first four bytes of the incoming packet.</param>
+    /// <param name="sequenceNumber">Unused for the identity cipher.</param>
     /// <param name="decryptedLength">Receives a copy of those four bytes.</param>
     /// <returns>The packet_length field value.</returns>
-    public uint DecryptLength(ReadOnlySpan<byte> peek, Span<byte> decryptedLength)
+    public uint DecryptLength(ReadOnlySpan<byte> peek, uint sequenceNumber, Span<byte> decryptedLength)
     {
         peek.Slice(0, 4).CopyTo(decryptedLength);
         return BinaryPrimitives.ReadUInt32BigEndian(peek);

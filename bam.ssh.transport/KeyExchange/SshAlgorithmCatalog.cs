@@ -27,7 +27,8 @@ public sealed class SshAlgorithmCatalog
             SshAlgorithmNames.ChaCha20Poly1305,
             SshAlgorithmNames.Aes256Gcm,
             SshAlgorithmNames.Aes128Gcm,
-            SshAlgorithmNames.Aes256Ctr),
+            SshAlgorithmNames.Aes256Ctr,
+            SshAlgorithmNames.Aes128Ctr),
         mac: new SshNameList(
             SshAlgorithmNames.HmacSha2256,
             SshAlgorithmNames.HmacSha2512),

@@ -162,9 +162,9 @@ internal sealed class RecordingPacketCipher : ISshPacketCipher
         _inner.TransformOutgoing(framedPacket, sequenceNumber, output);
     }
 
-    public uint DecryptLength(ReadOnlySpan<byte> peek, Span<byte> decryptedLength)
+    public uint DecryptLength(ReadOnlySpan<byte> peek, uint sequenceNumber, Span<byte> decryptedLength)
     {
-        return _inner.DecryptLength(peek, decryptedLength);
+        return _inner.DecryptLength(peek, sequenceNumber, decryptedLength);
     }
 
     public bool VerifyAndDecrypt(ReadOnlySpan<byte> wirePacket, uint sequenceNumber, IBufferWriter<byte> output)
