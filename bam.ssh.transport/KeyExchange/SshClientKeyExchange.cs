@@ -53,7 +53,7 @@ public sealed class SshClientKeyExchange
     /// <exception cref="SshKeyExchangeException">Negotiation failed, a message was malformed, or the host-key signature did not verify.</exception>
     public ValueTask<SshKeyExchangeResult> PerformAsync(CancellationToken cancellationToken = default)
     {
-        return ExecuteAsync(existingSessionId: null, cancellationToken);
+        return ExecuteAsync(existingSessionId: null, _transport, cancellationToken);
     }
 
     /// <summary>
@@ -63,17 +63,22 @@ public sealed class SshClientKeyExchange
     /// application data with the rekey exchange.
     /// </summary>
     /// <param name="sessionId">The session identifier established by the first exchange.</param>
+    /// <param name="packetSource">
+    /// The source of inbound key-exchange packets. When re-keying under a connection's receive loop the
+    /// connection supplies an <see cref="SshPacketQueue"/> it feeds from the loop (the loop stays the
+    /// sole reader of the transport); pass <see langword="null"/> to read the transport directly.
+    /// </param>
     /// <param name="cancellationToken">Cancels the exchange.</param>
     /// <returns>The renegotiated algorithms, verified host key, and freshly derived session keys.</returns>
     /// <exception cref="ArgumentNullException">The session id is null.</exception>
     /// <exception cref="SshKeyExchangeException">Negotiation failed, a message was malformed, or the host-key signature did not verify.</exception>
-    public ValueTask<SshKeyExchangeResult> RekeyAsync(byte[] sessionId, CancellationToken cancellationToken = default)
+    public ValueTask<SshKeyExchangeResult> RekeyAsync(byte[] sessionId, ISshPacketSource? packetSource = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(sessionId);
-        return ExecuteAsync(sessionId, cancellationToken);
+        return ExecuteAsync(sessionId, packetSource ?? _transport, cancellationToken);
     }
 
-    private async ValueTask<SshKeyExchangeResult> ExecuteAsync(byte[]? existingSessionId, CancellationToken cancellationToken)
+    private async ValueTask<SshKeyExchangeResult> ExecuteAsync(byte[]? existingSessionId, ISshPacketSource packetSource, CancellationToken cancellationToken)
     {
         using Activity? activity = SshActivitySource.Instance.StartActivity("ssh.key_exchange");
 
@@ -82,7 +87,7 @@ public sealed class SshClientKeyExchange
         byte[] clientKexInitPayload = SerializeLocalKexInit();
         await _transport.SendPacketAsync(clientKexInitPayload, cancellationToken).ConfigureAwait(false);
 
-        byte[] serverKexInitPayload = await ReceivePayloadAsync(SshMessageNumber.KexInit, cancellationToken).ConfigureAwait(false);
+        byte[] serverKexInitPayload = await ReceivePayloadAsync(packetSource, SshMessageNumber.KexInit, cancellationToken).ConfigureAwait(false);
         SshKexInit clientKexInit = SshKexInit.Parse(clientKexInitPayload);
         SshKexInit serverKexInit = SshKexInit.Parse(serverKexInitPayload);
         SshNegotiatedAlgorithms algorithms = SshAlgorithmNegotiation.Negotiate(clientKexInit, serverKexInit);
@@ -97,7 +102,7 @@ public sealed class SshClientKeyExchange
         byte[] clientPublicValue = algorithm.CreateClientPublicValue();
         await SendKexInitiationAsync(clientPublicValue, algorithm.PublicValueFormat, cancellationToken).ConfigureAwait(false);
 
-        SshKeyExchangeReply reply = await ReceiveKexReplyAsync(algorithm.PublicValueFormat, cancellationToken).ConfigureAwait(false);
+        SshKeyExchangeReply reply = await ReceiveKexReplyAsync(packetSource, algorithm.PublicValueFormat, cancellationToken).ConfigureAwait(false);
 
         byte[] sharedSecret = algorithm.DeriveSharedSecret(reply.ServerPublicValue);
         byte[] exchangeHash = SshExchangeHash.Compute(
@@ -119,7 +124,7 @@ public sealed class SshClientKeyExchange
                 $"The server host-key signature did not verify (host key {hostKey.Algorithm}, fingerprint {hostKey.Fingerprint}).");
         }
 
-        await ExchangeNewKeysAsync(cancellationToken).ConfigureAwait(false);
+        await ExchangeNewKeysAsync(packetSource, cancellationToken).ConfigureAwait(false);
 
         SshSessionKeys sessionKeys = DeriveSessionKeys(algorithm.HashAlgorithm, sharedSecret, exchangeHash, existingSessionId);
         ActivateCiphers(algorithms, sessionKeys);
@@ -165,9 +170,9 @@ public sealed class SshClientKeyExchange
         await _transport.SendPacketAsync(writer.WrittenMemory, cancellationToken).ConfigureAwait(false);
     }
 
-    private async ValueTask<SshKeyExchangeReply> ReceiveKexReplyAsync(SshKeyExchangePublicValueFormat format, CancellationToken cancellationToken)
+    private async ValueTask<SshKeyExchangeReply> ReceiveKexReplyAsync(ISshPacketSource packetSource, SshKeyExchangePublicValueFormat format, CancellationToken cancellationToken)
     {
-        byte[] payload = await ReceivePayloadAsync(SshMessageNumber.KexExchangeSpecific31, cancellationToken).ConfigureAwait(false);
+        byte[] payload = await ReceivePayloadAsync(packetSource, SshMessageNumber.KexExchangeSpecific31, cancellationToken).ConfigureAwait(false);
         try
         {
             SshWireReader reader = new SshWireReader(payload);
@@ -185,11 +190,11 @@ public sealed class SshClientKeyExchange
         }
     }
 
-    private async ValueTask ExchangeNewKeysAsync(CancellationToken cancellationToken)
+    private async ValueTask ExchangeNewKeysAsync(ISshPacketSource packetSource, CancellationToken cancellationToken)
     {
         byte[] newKeys = new byte[] { (byte)SshMessageNumber.NewKeys };
         await _transport.SendPacketAsync(newKeys, cancellationToken).ConfigureAwait(false);
-        byte[] serverNewKeys = await ReceivePayloadAsync(SshMessageNumber.NewKeys, cancellationToken).ConfigureAwait(false);
+        byte[] serverNewKeys = await ReceivePayloadAsync(packetSource, SshMessageNumber.NewKeys, cancellationToken).ConfigureAwait(false);
         if (serverNewKeys.Length != 1)
         {
             throw new SshKeyExchangeException("The SSH_MSG_NEWKEYS message carried unexpected data.");
@@ -211,9 +216,9 @@ public sealed class SshClientKeyExchange
             SshKeyDerivation.DeriveKey(hashAlgorithm, sharedSecret, exchangeHash, SshKeyDerivation.IntegrityKeyServerToClient, sessionId, DerivedKeyLength));
     }
 
-    private async ValueTask<byte[]> ReceivePayloadAsync(SshMessageNumber expected, CancellationToken cancellationToken)
+    private static async ValueTask<byte[]> ReceivePayloadAsync(ISshPacketSource packetSource, SshMessageNumber expected, CancellationToken cancellationToken)
     {
-        using SshIncomingPacket packet = await _transport.ReceivePacketAsync(cancellationToken).ConfigureAwait(false);
+        using SshIncomingPacket packet = await packetSource.ReceivePacketAsync(cancellationToken).ConfigureAwait(false);
         if (packet.IsEmpty || packet.MessageNumber != (byte)expected)
         {
             byte actual = packet.IsEmpty ? (byte)0 : packet.MessageNumber;

@@ -12,7 +12,7 @@ namespace Bam.Ssh.Transport;
 /// and drive this through <see cref="SendPacketAsync"/> / <see cref="ReceivePacketAsync"/>.
 /// Owns the underlying transport and disposes it. Not thread-safe; callers serialize sends and reads.
 /// </summary>
-public sealed class SshTransport : IAsyncDisposable
+public sealed class SshTransport : IAsyncDisposable, ISshPacketSource
 {
     private readonly ISshDuplexStream _stream;
     private readonly SshTransportOptions _options;
