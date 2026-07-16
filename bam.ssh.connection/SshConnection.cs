@@ -19,9 +19,10 @@ public sealed class SshConnection : IAsyncDisposable
 {
     private readonly SshTransport _transport;
     private readonly byte[] _sessionId;
-    private readonly SshClientKeyExchange _keyExchange;
+    private readonly ISshRekeyDriver _keyExchange;
     private readonly SshConnectionOptions _options;
     private readonly ISshLogger _logger;
+    private readonly ISshChannelOpenHandler? _channelOpenHandler;
 
     private readonly ConcurrentDictionary<uint, SshChannel> _channels = new ConcurrentDictionary<uint, SshChannel>();
     private readonly ConcurrentQueue<TaskCompletionSource<bool>> _pendingGlobalRequests = new ConcurrentQueue<TaskCompletionSource<bool>>();
@@ -44,16 +45,18 @@ public sealed class SshConnection : IAsyncDisposable
     /// </summary>
     /// <param name="transport">The authenticated, keyed transport. Owned by this connection.</param>
     /// <param name="sessionId">The session identifier from key exchange (preserved across re-keys).</param>
-    /// <param name="keyExchange">The key-exchange driver used for re-keying; defaults to a new one over the transport.</param>
+    /// <param name="keyExchange">The re-key driver (client or server role); defaults to a client driver over the transport.</param>
     /// <param name="options">Connection tunables; defaults to <see cref="SshConnectionOptions.Default"/>.</param>
     /// <param name="logger">The logger; defaults to <see cref="NullSshLogger.Instance"/>.</param>
     /// <exception cref="ArgumentNullException">The transport or session id is null.</exception>
+    /// <param name="channelOpenHandler">Handles peer-initiated channel opens (server role); null rejects them.</param>
     public SshConnection(
         SshTransport transport,
         byte[] sessionId,
-        SshClientKeyExchange? keyExchange = null,
+        ISshRekeyDriver? keyExchange = null,
         SshConnectionOptions? options = null,
-        ISshLogger? logger = null)
+        ISshLogger? logger = null,
+        ISshChannelOpenHandler? channelOpenHandler = null)
     {
         ArgumentNullException.ThrowIfNull(transport);
         ArgumentNullException.ThrowIfNull(sessionId);
@@ -62,6 +65,7 @@ public sealed class SshConnection : IAsyncDisposable
         _keyExchange = keyExchange ?? new SshClientKeyExchange(transport);
         _options = options ?? SshConnectionOptions.Default;
         _logger = logger ?? NullSshLogger.Instance;
+        _channelOpenHandler = channelOpenHandler;
         _lastRekeyTicks = Environment.TickCount64;
         _writerTask = WriterLoopAsync(_shutdown.Token);
         _dispatchTask = DispatchLoopAsync(_shutdown.Token);
@@ -69,9 +73,17 @@ public sealed class SshConnection : IAsyncDisposable
 
     /// <summary>
     /// Raised when the peer attempts to open a channel. The client rejects it (see
-    /// <see cref="SshChannelOpenEventArgs"/>); the server role accepts opens in a later phase.
+    /// <see cref="SshChannelOpenEventArgs"/>); the server role accepts opens via an
+    /// <see cref="ISshChannelOpenHandler"/> supplied to the constructor.
     /// </summary>
     public event EventHandler<SshChannelOpenEventArgs>? ChannelOpenReceived;
+
+    /// <summary>
+    /// Gets a task that completes when the receive-dispatch loop ends — because the connection was
+    /// disposed, the peer closed the transport, or the transport faulted. The server role awaits this to
+    /// learn when a peer connection has terminated so it can release the per-connection session.
+    /// </summary>
+    public Task Completion => _dispatchTask;
 
     /// <summary>
     /// Opens a <c>session</c> channel and wraps it for interactive/command use.
@@ -292,7 +304,7 @@ public sealed class SshConnection : IAsyncDisposable
                 CompleteGlobalRequest(false);
                 break;
             case SshMessageNumber.ChannelOpen:
-                HandleChannelOpen(packet.Body);
+                await HandleChannelOpenAsync(ParseChannelOpen(packet.Body), cancellationToken).ConfigureAwait(false);
                 break;
             case SshMessageNumber.ChannelOpenConfirmation:
                 HandleChannelOpenConfirmation(packet.Body);
@@ -333,23 +345,86 @@ public sealed class SshConnection : IAsyncDisposable
         }
     }
 
-    private void HandleChannelOpen(ReadOnlySpan<byte> body)
+    private static ParsedChannelOpen ParseChannelOpen(ReadOnlySpan<byte> body)
     {
         SshWireReader reader = new SshWireReader(body);
         string channelType = reader.ReadText();
         uint senderChannel = reader.ReadUInt32();
         uint initialWindow = reader.ReadUInt32();
         uint maximumPacket = reader.ReadUInt32();
-        ChannelOpenReceived?.Invoke(this, new SshChannelOpenEventArgs(channelType, senderChannel, initialWindow, maximumPacket));
+        byte[] typeSpecific = reader.Remaining > 0 ? reader.ReadRaw(reader.Remaining).ToArray() : Array.Empty<byte>();
+        return new ParsedChannelOpen(channelType, senderChannel, initialWindow, maximumPacket, typeSpecific);
+    }
 
+    private async ValueTask HandleChannelOpenAsync(ParsedChannelOpen open, CancellationToken cancellationToken)
+    {
+        ChannelOpenReceived?.Invoke(this, new SshChannelOpenEventArgs(open.ChannelType, open.SenderChannel, open.InitialWindow, open.MaximumPacket));
+
+        if (_channelOpenHandler != null)
+        {
+            SshChannelOpenRequestContext context = new SshChannelOpenRequestContext(
+                this, open.ChannelType, open.TypeSpecificData, open.SenderChannel, open.InitialWindow, open.MaximumPacket);
+            await _channelOpenHandler.HandleOpenAsync(context, cancellationToken).ConfigureAwait(false);
+            if (!context.Resolved)
+            {
+                RejectInboundChannel(open.SenderChannel, SshChannelOpenFailureReason.UnknownChannelType, "Channel type not handled.");
+            }
+            return;
+        }
+
+        RejectInboundChannel(open.SenderChannel, SshChannelOpenFailureReason.UnknownChannelType, "Channel opening is not supported by this endpoint.");
+    }
+
+    internal SshChannel AcceptInboundChannel(string channelType, uint remoteId, uint remoteWindow, uint remoteMaximumPacket)
+    {
+        uint localId = (uint)Interlocked.Increment(ref _nextChannelId);
+        SshChannel channel = new SshChannel(this, localId, channelType, _options.InitialWindowSize);
+        _channels[localId] = channel;
+        channel.CompleteOpen(remoteId, remoteWindow, remoteMaximumPacket);
+
+        using PooledBufferWriter writer = new PooledBufferWriter(32);
+        SshWireWriter wire = new SshWireWriter(writer);
+        wire.WriteByte((byte)SshMessageNumber.ChannelOpenConfirmation);
+        wire.WriteUInt32(remoteId);
+        wire.WriteUInt32(localId);
+        wire.WriteUInt32((uint)_options.InitialWindowSize);
+        wire.WriteUInt32((uint)_options.MaximumPacketSize);
+        PostSend(writer.WrittenSpan.ToArray());
+        return channel;
+    }
+
+    internal void RejectInboundChannel(uint remoteId, SshChannelOpenFailureReason reason, string description)
+    {
         using PooledBufferWriter writer = new PooledBufferWriter(64);
         SshWireWriter wire = new SshWireWriter(writer);
         wire.WriteByte((byte)SshMessageNumber.ChannelOpenFailure);
-        wire.WriteUInt32(senderChannel);
-        wire.WriteUInt32((uint)SshChannelOpenFailureReason.UnknownChannelType);
-        wire.WriteText("Channel opening is not supported by this endpoint.");
+        wire.WriteUInt32(remoteId);
+        wire.WriteUInt32((uint)reason);
+        wire.WriteText(description);
         wire.WriteText(string.Empty);
         PostSend(writer.WrittenSpan.ToArray());
+    }
+
+    private sealed class ParsedChannelOpen
+    {
+        public ParsedChannelOpen(string channelType, uint senderChannel, uint initialWindow, uint maximumPacket, byte[] typeSpecificData)
+        {
+            ChannelType = channelType;
+            SenderChannel = senderChannel;
+            InitialWindow = initialWindow;
+            MaximumPacket = maximumPacket;
+            TypeSpecificData = typeSpecificData;
+        }
+
+        public string ChannelType { get; }
+
+        public uint SenderChannel { get; }
+
+        public uint InitialWindow { get; }
+
+        public uint MaximumPacket { get; }
+
+        public byte[] TypeSpecificData { get; }
     }
 
     private void HandleChannelOpenConfirmation(ReadOnlySpan<byte> body)

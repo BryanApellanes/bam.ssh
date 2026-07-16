@@ -128,6 +128,39 @@ public sealed class SshChannel
     }
 
     /// <summary>
+    /// Writes extended data (e.g. standard error) to the channel, chunked and metered exactly like
+    /// <see cref="WriteAsync"/>. Used by the server role to send a command's stderr stream.
+    /// </summary>
+    /// <param name="dataType">The extended-data type (e.g. <see cref="SshExtendedDataType.StandardError"/>).</param>
+    /// <param name="data">The bytes to send.</param>
+    /// <param name="cancellationToken">Cancels the write.</param>
+    /// <exception cref="SshChannelException">The channel is not open, or EOF/CLOSE has been sent.</exception>
+    public async ValueTask WriteExtendedAsync(SshExtendedDataType dataType, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        SshSendWindow window = EnsureOpen();
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_sentEof || _sentClose)
+            {
+                throw new SshChannelException("Cannot write to a channel after EOF or CLOSE has been sent.");
+            }
+            int offset = 0;
+            while (offset < data.Length)
+            {
+                int want = Math.Min(data.Length - offset, _remoteMaximumPacketSize);
+                int granted = await window.ReserveAsync(want, cancellationToken).ConfigureAwait(false);
+                await SendExtendedDataAsync(dataType, data.Slice(offset, granted), cancellationToken).ConfigureAwait(false);
+                offset += granted;
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Sends a channel request (RFC 4254 §5.4). When <paramref name="wantReply"/> is set, awaits the
     /// peer's CHANNEL_SUCCESS/CHANNEL_FAILURE and returns whether it succeeded; otherwise returns true.
     /// </summary>
@@ -268,12 +301,18 @@ public sealed class SshChannel
 
     internal void AcceptRequest(string requestType, bool wantReply, ReadOnlyMemory<byte> requestData)
     {
-        RequestReceived?.Invoke(this, new SshChannelRequestEventArgs(requestType, wantReply, requestData));
-        if (wantReply)
+        SshChannelRequestEventArgs args = new SshChannelRequestEventArgs(this, requestType, wantReply, requestData);
+        RequestReceived?.Invoke(this, args);
+        if (wantReply && !args.WasReplied)
         {
-            // A transport-generic channel accepts no peer-initiated requests; reply FAILURE.
+            // No subscriber accepted the request (or there is none); reply FAILURE.
             _connection.PostSend(BuildSingleIdMessage(SshMessageNumber.ChannelFailure));
         }
+    }
+
+    internal void PostRequestReply(bool success)
+    {
+        _connection.PostSend(BuildSingleIdMessage(success ? SshMessageNumber.ChannelSuccess : SshMessageNumber.ChannelFailure));
     }
 
     internal void AcceptClose()
@@ -316,6 +355,17 @@ public sealed class SshChannel
         SshWireWriter wire = new SshWireWriter(writer);
         wire.WriteByte((byte)SshMessageNumber.ChannelData);
         wire.WriteUInt32(_remoteId);
+        wire.WriteString(chunk.Span);
+        await _connection.SendAsync(writer.WrittenMemory, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask SendExtendedDataAsync(SshExtendedDataType dataType, ReadOnlyMemory<byte> chunk, CancellationToken cancellationToken)
+    {
+        using PooledBufferWriter writer = new PooledBufferWriter(20 + chunk.Length);
+        SshWireWriter wire = new SshWireWriter(writer);
+        wire.WriteByte((byte)SshMessageNumber.ChannelExtendedData);
+        wire.WriteUInt32(_remoteId);
+        wire.WriteUInt32((uint)dataType);
         wire.WriteString(chunk.Span);
         await _connection.SendAsync(writer.WrittenMemory, cancellationToken).ConfigureAwait(false);
     }

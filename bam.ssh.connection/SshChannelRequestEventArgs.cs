@@ -8,16 +8,14 @@ namespace Bam.Ssh.Connection;
 /// </summary>
 public sealed class SshChannelRequestEventArgs : EventArgs
 {
-    /// <summary>
-    /// Initializes the event data.
-    /// </summary>
-    /// <param name="requestType">The request type name (e.g. <c>exit-status</c>).</param>
-    /// <param name="wantReply">Whether the peer requested a CHANNEL_SUCCESS/FAILURE reply.</param>
-    /// <param name="requestData">The request-type-specific bytes following the common fields.</param>
-    /// <exception cref="ArgumentNullException">The request type is null.</exception>
-    public SshChannelRequestEventArgs(string requestType, bool wantReply, ReadOnlyMemory<byte> requestData)
+    private readonly SshChannel _channel;
+    private bool _replied;
+
+    internal SshChannelRequestEventArgs(SshChannel channel, string requestType, bool wantReply, ReadOnlyMemory<byte> requestData)
     {
+        ArgumentNullException.ThrowIfNull(channel);
         ArgumentNullException.ThrowIfNull(requestType);
+        _channel = channel;
         RequestType = requestType;
         WantReply = wantReply;
         RequestData = requestData;
@@ -37,4 +35,25 @@ public sealed class SshChannelRequestEventArgs : EventArgs
     /// Gets the request-type-specific bytes.
     /// </summary>
     public ReadOnlyMemory<byte> RequestData { get; }
+
+    /// <summary>
+    /// Gets whether a reply has been sent for this request.
+    /// </summary>
+    public bool WasReplied => _replied;
+
+    /// <summary>
+    /// Replies to the request (a server role accepting or refusing it). Only meaningful when
+    /// <see cref="WantReply"/> is set; the first call wins. If a handler leaves a <c>want_reply</c>
+    /// request unanswered, the channel replies with failure automatically.
+    /// </summary>
+    /// <param name="success">True to send CHANNEL_SUCCESS, false to send CHANNEL_FAILURE.</param>
+    public void Reply(bool success)
+    {
+        if (!WantReply || _replied)
+        {
+            return;
+        }
+        _replied = true;
+        _channel.PostRequestReply(success);
+    }
 }
