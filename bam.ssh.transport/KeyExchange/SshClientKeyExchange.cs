@@ -11,7 +11,7 @@ namespace Bam.Ssh.Transport;
 /// key, and the derived <see cref="SshSessionKeys"/> — which Phase 4 turns into live ciphers via
 /// <see cref="SshTransport.ApplyKeys"/>. A failed signature verification is a hard rejection.
 /// </summary>
-public sealed class SshClientKeyExchange
+public sealed class SshClientKeyExchange : ISshRekeyDriver
 {
     // Derive a uniform, generous length for each key. Because RFC 4253 §7.2 derivation is a prefix
     // relationship, Phase 4 slices the exact prefix each negotiated cipher/MAC needs (max: 64-byte
