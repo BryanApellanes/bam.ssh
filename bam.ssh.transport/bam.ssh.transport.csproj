@@ -22,4 +22,12 @@
     <ProjectReference Include="..\bam.ssh.common\bam.ssh.common.csproj" />
   </ItemGroup>
 
+  <!-- BouncyCastle is admitted here (D-009) only for the primitives the .NET BCL lacks:
+       X25519 (curve25519-sha256 key exchange) and Ed25519 (ssh-ed25519 host keys).
+       It is pure-managed and Native AOT / trim compatible. All other cryptography
+       (ECDH P-256, DH group14, RSA, ECDSA, SHA-2) uses System.Security.Cryptography. -->
+  <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+  </ItemGroup>
+
 </Project>
