@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\bam.ssh.connection\bam.ssh.connection.csproj" />
+    <ProjectReference Include="..\bam.ssh.sftp\bam.ssh.sftp.csproj" />
   </ItemGroup>
 
 </Project>
