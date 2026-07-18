@@ -18,11 +18,15 @@ public sealed class AesCtrCipher : ISshPacketCipher, IDisposable
 {
     private const int BlockLength = 16;
 
+    // Counter blocks are encrypted in batches of this many per one-shot ECB call rather than one block at a
+    // time, cutting the per-packet call count (and its per-call overhead) by this factor.
+    private const int KeystreamBatchBlocks = 64;
+
     private readonly Aes _aes;
     private readonly byte[] _counter;
-    private readonly byte[] _macKey;
-    private readonly HashAlgorithmName _macAlgorithm;
     private readonly int _macLength;
+    // The HMAC is created once and reset per packet (GetHashAndReset) rather than reallocated each call.
+    private readonly IncrementalHash _mac;
 
     /// <summary>
     /// Initializes the cipher for one direction.
@@ -46,9 +50,8 @@ public sealed class AesCtrCipher : ISshPacketCipher, IDisposable
         _aes = Aes.Create();
         _aes.Key = key.ToArray();
         _counter = iv.Slice(0, BlockLength).ToArray();
-        _macKey = integrityKey.ToArray();
-        _macAlgorithm = macAlgorithm;
         _macLength = macLength;
+        _mac = IncrementalHash.CreateHMAC(macAlgorithm, integrityKey);
     }
 
     /// <summary>
@@ -136,30 +139,44 @@ public sealed class AesCtrCipher : ISshPacketCipher, IDisposable
     }
 
     /// <summary>
-    /// Releases the underlying <see cref="Aes"/> instance.
+    /// Releases the underlying <see cref="Aes"/> instance and the HMAC.
     /// </summary>
     public void Dispose()
     {
         _aes.Dispose();
+        _mac.Dispose();
     }
 
     private void CounterTransform(ReadOnlySpan<byte> input, Span<byte> output)
     {
         Span<byte> counter = stackalloc byte[BlockLength];
         _counter.CopyTo(counter);
-        Span<byte> keystream = stackalloc byte[BlockLength];
+        // Generate the keystream a batch of blocks at a time: fill the counter blocks, encrypt them in one
+        // ECB call, then XOR. This is bit-for-bit identical to per-block encryption (each ECB block is
+        // independent) but cuts the number of one-shot calls — and their overhead — by the batch factor.
+        Span<byte> counterBatch = stackalloc byte[BlockLength * KeystreamBatchBlocks];
+        Span<byte> keystreamBatch = stackalloc byte[BlockLength * KeystreamBatchBlocks];
 
         int offset = 0;
         while (offset < input.Length)
         {
-            _aes.EncryptEcb(counter, keystream, PaddingMode.None);
-            int blockSize = Math.Min(BlockLength, input.Length - offset);
-            for (int i = 0; i < blockSize; i++)
+            int remaining = input.Length - offset;
+            int blocks = Math.Min(KeystreamBatchBlocks, (remaining + BlockLength - 1) / BlockLength);
+            for (int b = 0; b < blocks; b++)
             {
-                output[offset + i] = (byte)(input[offset + i] ^ keystream[i]);
+                counter.CopyTo(counterBatch.Slice(b * BlockLength, BlockLength));
+                IncrementCounter(counter);
             }
-            IncrementCounter(counter);
-            offset += blockSize;
+
+            int batchBytes = blocks * BlockLength;
+            _aes.EncryptEcb(counterBatch.Slice(0, batchBytes), keystreamBatch.Slice(0, batchBytes), PaddingMode.None);
+
+            int chunk = Math.Min(batchBytes, remaining);
+            for (int i = 0; i < chunk; i++)
+            {
+                output[offset + i] = (byte)(input[offset + i] ^ keystreamBatch[i]);
+            }
+            offset += chunk;
         }
 
         counter.CopyTo(_counter);
@@ -169,11 +186,10 @@ public sealed class AesCtrCipher : ISshPacketCipher, IDisposable
     {
         Span<byte> sequence = stackalloc byte[4];
         BinaryPrimitives.WriteUInt32BigEndian(sequence, sequenceNumber);
-        using IncrementalHash hash = IncrementalHash.CreateHMAC(_macAlgorithm, _macKey);
-        hash.AppendData(sequence);
-        hash.AppendData(cleartextPacket);
+        _mac.AppendData(sequence);
+        _mac.AppendData(cleartextPacket);
         Span<byte> full = stackalloc byte[64];
-        hash.GetHashAndReset(full);
+        _mac.GetHashAndReset(full);
         full.Slice(0, _macLength).CopyTo(mac);
     }
 
