@@ -26,6 +26,7 @@ public sealed class SshServerSession : ISshChannelOpenHandler, IAsyncDisposable
     private readonly ISshLogger _logger;
 
     private SshConnection? _connection;
+    private SshServerForwarding? _forwarding;
 
     internal SshServerSession(string userName, SshServerCommandMap commandMap, CancellationToken shutdownToken, ISshLogger logger)
     {
@@ -49,6 +50,11 @@ public sealed class SshServerSession : ISshChannelOpenHandler, IAsyncDisposable
     internal void AttachConnection(SshConnection connection)
     {
         _connection = connection;
+    }
+
+    internal void AttachForwarding(SshServerForwarding forwarding)
+    {
+        _forwarding = forwarding;
     }
 
     /// <inheritdoc/>
@@ -159,9 +165,16 @@ public sealed class SshServerSession : ISshChannelOpenHandler, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        return _connection?.DisposeAsync() ?? ValueTask.CompletedTask;
+        if (_forwarding != null)
+        {
+            await _forwarding.DisposeAsync().ConfigureAwait(false);
+        }
+        if (_connection != null)
+        {
+            await _connection.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     private sealed class ChannelState

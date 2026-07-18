@@ -22,6 +22,7 @@
     <ProjectReference Include="..\bam.ssh.connection\bam.ssh.connection.csproj" />
     <ProjectReference Include="..\bam.ssh.sftp\bam.ssh.sftp.csproj" />
     <ProjectReference Include="..\bam.ssh.scp\bam.ssh.scp.csproj" />
+    <ProjectReference Include="..\bam.ssh.forwarding\bam.ssh.forwarding.csproj" />
     <ProjectReference Include="..\bam.ssh.terminal\bam.ssh.terminal.csproj" />
   </ItemGroup>
 
