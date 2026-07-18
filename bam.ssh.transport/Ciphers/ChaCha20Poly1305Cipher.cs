@@ -28,8 +28,14 @@ public sealed class ChaCha20Poly1305Cipher : ISshPacketCipher
     private const int PolyKeyLength = 32;
     private const int ChaChaBlockLength = 64;
 
-    private readonly byte[] _payloadKey;
-    private readonly byte[] _lengthKey;
+    // The key material and the ChaCha20/Poly1305 primitives are reused across packets rather than
+    // reallocated per packet: this cipher serves one direction and is not thread-safe, so re-Init before
+    // each use resets the state safely. Only the per-packet nonce/poly-key parameters are constructed anew.
+    private readonly KeyParameter _payloadKeyParam;
+    private readonly KeyParameter _lengthKeyParam;
+    private readonly ChaChaEngine _payloadEngine = new ChaChaEngine();
+    private readonly ChaChaEngine _lengthEngine = new ChaChaEngine();
+    private readonly Poly1305 _poly = new Poly1305();
 
     /// <summary>
     /// Initializes the cipher for one direction from its 64-byte key.
@@ -43,8 +49,8 @@ public sealed class ChaCha20Poly1305Cipher : ISshPacketCipher
         {
             throw new ArgumentException($"chacha20-poly1305 requires a {KeyLength}-byte key.", nameof(key));
         }
-        _payloadKey = key.Slice(0, PolyKeyLength).ToArray();
-        _lengthKey = key.Slice(PolyKeyLength, PolyKeyLength).ToArray();
+        _payloadKeyParam = new KeyParameter(key.Slice(0, PolyKeyLength));
+        _lengthKeyParam = new KeyParameter(key.Slice(PolyKeyLength, PolyKeyLength));
     }
 
     /// <summary>
@@ -81,10 +87,10 @@ public sealed class ChaCha20Poly1305Cipher : ISshPacketCipher
         EncryptLength(framedPacket.Slice(0, LengthFieldLength), nonce, encryptedLength);
 
         Span<byte> polyKey = stackalloc byte[PolyKeyLength];
-        ChaChaEngine payloadCipher = CreatePayloadCipher(nonce, polyKey);
+        InitPayloadCipher(nonce, polyKey);
 
         Span<byte> encryptedPayload = destination.Slice(LengthFieldLength, payloadLength);
-        payloadCipher.ProcessBytes(framedPacket.Slice(LengthFieldLength), encryptedPayload);
+        _payloadEngine.ProcessBytes(framedPacket.Slice(LengthFieldLength), encryptedPayload);
 
         Span<byte> tag = destination.Slice(LengthFieldLength + payloadLength, TagLength);
         ComputePoly1305(polyKey, destination.Slice(0, LengthFieldLength + payloadLength), tag);
@@ -130,7 +136,7 @@ public sealed class ChaCha20Poly1305Cipher : ISshPacketCipher
         BinaryPrimitives.WriteUInt64BigEndian(nonce, sequenceNumber);
 
         Span<byte> polyKey = stackalloc byte[PolyKeyLength];
-        ChaChaEngine payloadCipher = CreatePayloadCipher(nonce, polyKey);
+        InitPayloadCipher(nonce, polyKey);
 
         Span<byte> computedTag = stackalloc byte[TagLength];
         ComputePoly1305(polyKey, wirePacket.Slice(0, cipherTextLength), computedTag);
@@ -141,41 +147,34 @@ public sealed class ChaCha20Poly1305Cipher : ISshPacketCipher
 
         Span<byte> destination = output.GetSpan(cipherTextLength).Slice(0, cipherTextLength);
         EncryptLength(wirePacket.Slice(0, LengthFieldLength), nonce, destination.Slice(0, LengthFieldLength));
-        payloadCipher.ProcessBytes(wirePacket.Slice(LengthFieldLength, payloadLength), destination.Slice(LengthFieldLength, payloadLength));
+        _payloadEngine.ProcessBytes(wirePacket.Slice(LengthFieldLength, payloadLength), destination.Slice(LengthFieldLength, payloadLength));
         output.Advance(cipherTextLength);
         return true;
     }
 
     private void EncryptLength(ReadOnlySpan<byte> input, ReadOnlySpan<byte> nonce, Span<byte> output)
     {
-        ChaChaEngine lengthCipher = new ChaChaEngine();
-        lengthCipher.Init(forEncryption: true, new ParametersWithIV(new KeyParameter(_lengthKey), nonce.ToArray()));
-        lengthCipher.ProcessBytes(input, output);
+        _lengthEngine.Init(forEncryption: true, new ParametersWithIV(_lengthKeyParam, nonce));
+        _lengthEngine.ProcessBytes(input, output);
     }
 
-    private ChaChaEngine CreatePayloadCipher(ReadOnlySpan<byte> nonce, Span<byte> polyKey)
+    private void InitPayloadCipher(ReadOnlySpan<byte> nonce, Span<byte> polyKey)
     {
-        ChaChaEngine payloadCipher = new ChaChaEngine();
-        payloadCipher.Init(forEncryption: true, new ParametersWithIV(new KeyParameter(_payloadKey), nonce.ToArray()));
+        _payloadEngine.Init(forEncryption: true, new ParametersWithIV(_payloadKeyParam, nonce));
 
         // Consume the full first 64-byte keystream block (counter 0): its first 32 bytes are the
         // Poly1305 one-time key; the rest is discarded. This leaves the engine positioned at counter
         // 1, which is where the payload keystream begins — equivalent to OpenSSH's explicit counter reset.
         Span<byte> firstBlock = stackalloc byte[ChaChaBlockLength];
         Span<byte> zero = stackalloc byte[ChaChaBlockLength];
-        payloadCipher.ProcessBytes(zero, firstBlock);
+        _payloadEngine.ProcessBytes(zero, firstBlock);
         firstBlock.Slice(0, PolyKeyLength).CopyTo(polyKey);
-        return payloadCipher;
     }
 
-    private static void ComputePoly1305(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, Span<byte> tag)
+    private void ComputePoly1305(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, Span<byte> tag)
     {
-        Poly1305 poly = new Poly1305();
-        poly.Init(new KeyParameter(key.ToArray()));
-        byte[] buffer = data.ToArray();
-        poly.BlockUpdate(buffer, 0, buffer.Length);
-        byte[] output = new byte[TagLength];
-        poly.DoFinal(output, 0);
-        output.CopyTo(tag);
+        _poly.Init(new KeyParameter(key));
+        _poly.BlockUpdate(data);
+        _poly.DoFinal(tag);
     }
 }

@@ -15,6 +15,9 @@ public sealed class SshPacketWriter
 {
     private readonly SshPacketEncoder _encoder;
     private readonly PipeWriter _output;
+    // Reused across packets (this writer is single-threaded; callers serialize) so framing does not allocate
+    // a wrapper per packet — the underlying pooled buffer grows to the largest packet and is then reused.
+    private readonly PooledBufferWriter _framed = new PooledBufferWriter();
     private ISshPacketCipher _cipher;
     private SshSequenceNumber _sequence;
 
@@ -61,13 +64,10 @@ public sealed class SshPacketWriter
     public async ValueTask WriteAsync(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
     {
         uint sequenceNumber = _sequence.Advance();
-        int framedLength = SshPacketEncoder.GetEncodedLength(payload.Length, _cipher.Geometry);
 
-        using (PooledBufferWriter framed = new PooledBufferWriter(framedLength))
-        {
-            _encoder.Encode(payload.Span, framed, _cipher.Geometry);
-            _cipher.TransformOutgoing(framed.WrittenSpan, sequenceNumber, _output);
-        }
+        _framed.Reset();
+        _encoder.Encode(payload.Span, _framed, _cipher.Geometry);
+        _cipher.TransformOutgoing(_framed.WrittenSpan, sequenceNumber, _output);
 
         await _output.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
