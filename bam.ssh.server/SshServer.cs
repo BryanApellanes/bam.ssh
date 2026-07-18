@@ -29,6 +29,7 @@ public sealed class SshServer : IAsyncDisposable
     private ISshPublicKeyAuthenticator? _publicKeyAuthenticator;
     private SshServerCommandHandler? _execHandler;
     private SshServerCommandHandler? _shellHandler;
+    private SshForwardingOptions? _forwardingOptions;
 
     private SshServerCommandMap? _commandMap;
     private Socket? _listener;
@@ -141,6 +142,18 @@ public sealed class SshServer : IAsyncDisposable
     }
 
     /// <summary>
+    /// Enables TCP/IP forwarding for served connections: the server honors a peer's <c>direct-tcpip</c>
+    /// (local/dynamic) and <c>tcpip-forward</c> (remote) requests per the given options. Off unless called.
+    /// </summary>
+    /// <param name="options">Which forwarding to allow and the gating policies; defaults to allowing both.</param>
+    /// <exception cref="SshServerException">The server is already serving.</exception>
+    public void EnableTcpForwarding(SshForwardingOptions? options = null)
+    {
+        EnsureNotServing();
+        _forwardingOptions = options ?? new SshForwardingOptions();
+    }
+
+    /// <summary>
     /// Binds a TCP listener on the endpoint and begins accepting connections in the background. Pass port 0
     /// to bind an ephemeral port and read the chosen endpoint from <see cref="ListenEndPoint"/>.
     /// </summary>
@@ -225,6 +238,11 @@ public sealed class SshServer : IAsyncDisposable
             SshConnection connection = new SshConnection(
                 transport, sessionId, keyExchange, _options.ConnectionOptions, _logger, session);
             session.AttachConnection(connection);
+            if (_forwardingOptions != null)
+            {
+                SshServerForwarding forwarding = new SshServerForwarding(connection, _options.ConnectionOptions, _forwardingOptions);
+                session.AttachForwarding(forwarding);
+            }
             if (_logger.IsEnabled(SshLogLevel.Information))
             {
                 _logger.Log(SshLogLevel.Information, "Authenticated user '{0}' via {1}.", authResult.UserName, authResult.MethodUsed);

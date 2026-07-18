@@ -1,5 +1,7 @@
+using System.Net;
 using Bam.Ssh.Authentication;
 using Bam.Ssh.Connection;
+using Bam.Ssh.Forwarding;
 using Bam.Ssh.Transport;
 
 namespace Bam.Ssh.Client;
@@ -221,6 +223,64 @@ public sealed class SshClient : IAsyncDisposable
             throw new SshConnectionStateException("The server refused to start a shell.");
         }
         return channel;
+    }
+
+    /// <summary>
+    /// Starts local (<c>-L</c>) forwarding: listens on a local port and tunnels each connection to a remote
+    /// target reachable from the server. Dispose the returned forwarder to stop listening.
+    /// </summary>
+    /// <param name="localPort">The local port to listen on (0 for an ephemeral port; read it from the result's ListenEndPoint).</param>
+    /// <param name="remoteHost">The host the server connects to.</param>
+    /// <param name="remotePort">The port the server connects to.</param>
+    /// <param name="localBindAddress">The local address to bind; defaults to loopback.</param>
+    /// <param name="cancellationToken">Cancels the bind.</param>
+    /// <returns>The running forwarder.</returns>
+    /// <exception cref="SshConnectionStateException">The client is not authenticated.</exception>
+    public async ValueTask<LocalPortForwarder> ForwardLocalPortAsync(int localPort, string remoteHost, int remotePort, string localBindAddress = "127.0.0.1", CancellationToken cancellationToken = default)
+    {
+        SshConnection connection = EnsureAuthenticated();
+        IPEndPoint bindEndPoint = new IPEndPoint(IPAddress.Parse(localBindAddress), localPort);
+        LocalPortForwarder forwarder = new LocalPortForwarder(connection, bindEndPoint, remoteHost, remotePort, _options.ConnectionOptions);
+        await forwarder.StartAsync(cancellationToken).ConfigureAwait(false);
+        return forwarder;
+    }
+
+    /// <summary>
+    /// Starts dynamic (<c>-D</c>) forwarding: runs a local SOCKS proxy and tunnels each negotiated connection
+    /// through the server. Dispose the returned forwarder to stop listening.
+    /// </summary>
+    /// <param name="localPort">The local port to run the SOCKS proxy on (0 for an ephemeral port).</param>
+    /// <param name="localBindAddress">The local address to bind; defaults to loopback.</param>
+    /// <param name="cancellationToken">Cancels the bind.</param>
+    /// <returns>The running forwarder.</returns>
+    /// <exception cref="SshConnectionStateException">The client is not authenticated.</exception>
+    public async ValueTask<DynamicPortForwarder> ForwardDynamicPortAsync(int localPort, string localBindAddress = "127.0.0.1", CancellationToken cancellationToken = default)
+    {
+        SshConnection connection = EnsureAuthenticated();
+        IPEndPoint bindEndPoint = new IPEndPoint(IPAddress.Parse(localBindAddress), localPort);
+        DynamicPortForwarder forwarder = new DynamicPortForwarder(connection, bindEndPoint, _options.ConnectionOptions);
+        await forwarder.StartAsync(cancellationToken).ConfigureAwait(false);
+        return forwarder;
+    }
+
+    /// <summary>
+    /// Starts remote (<c>-R</c>) forwarding: asks the server to listen on a port and tunnels each connection
+    /// there to a local target. Dispose the returned forwarder to cancel the forward.
+    /// </summary>
+    /// <param name="remotePort">The port the server binds (0 to let the server choose; read the chosen port from the result's BoundPort).</param>
+    /// <param name="localHost">The local host forwarded connections are routed to.</param>
+    /// <param name="localPort">The local port forwarded connections are routed to.</param>
+    /// <param name="remoteBindAddress">The address the server binds; empty (default) for all interfaces.</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    /// <returns>The running forwarder (its BoundPort holds the server-bound port).</returns>
+    /// <exception cref="SshConnectionStateException">The client is not authenticated.</exception>
+    /// <exception cref="SshForwardingException">The server refused the forward.</exception>
+    public async ValueTask<RemotePortForwarder> ForwardRemotePortAsync(int remotePort, string localHost, int localPort, string remoteBindAddress = "", CancellationToken cancellationToken = default)
+    {
+        SshConnection connection = EnsureAuthenticated();
+        RemotePortForwarder forwarder = new RemotePortForwarder(connection, remoteBindAddress, remotePort, localHost, localPort, _options.ConnectionOptions);
+        await forwarder.StartAsync(cancellationToken).ConfigureAwait(false);
+        return forwarder;
     }
 
     private static async Task<byte[]> ReadStreamAsync(Func<Memory<byte>, CancellationToken, ValueTask<int>> read, CancellationToken cancellationToken)

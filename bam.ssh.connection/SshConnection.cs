@@ -25,7 +25,9 @@ public sealed class SshConnection : IAsyncDisposable
     private readonly ISshChannelOpenHandler? _channelOpenHandler;
 
     private readonly ConcurrentDictionary<uint, SshChannel> _channels = new ConcurrentDictionary<uint, SshChannel>();
-    private readonly ConcurrentQueue<TaskCompletionSource<bool>> _pendingGlobalRequests = new ConcurrentQueue<TaskCompletionSource<bool>>();
+    private readonly ConcurrentDictionary<string, ISshChannelOpenHandler> _channelOpenHandlers = new ConcurrentDictionary<string, ISshChannelOpenHandler>(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ISshGlobalRequestHandler> _globalRequestHandlers = new ConcurrentDictionary<string, ISshGlobalRequestHandler>(StringComparer.Ordinal);
+    private readonly ConcurrentQueue<TaskCompletionSource<SshGlobalRequestReply>> _pendingGlobalRequests = new ConcurrentQueue<TaskCompletionSource<SshGlobalRequestReply>>();
     private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1, 1);
     private readonly Channel<OutboundItem> _outbound =
         System.Threading.Channels.Channel.CreateUnbounded<OutboundItem>(new UnboundedChannelOptions { SingleReader = true });
@@ -84,6 +86,62 @@ public sealed class SshConnection : IAsyncDisposable
     /// learn when a peer connection has terminated so it can release the per-connection session.
     /// </summary>
     public Task Completion => _dispatchTask;
+
+    /// <summary>
+    /// Registers a handler for peer-initiated channel opens of the given type, taking priority over the
+    /// fallback handler supplied to the constructor. Used to accept forwarding channels — the client
+    /// accepts <c>forwarded-tcpip</c>, the server accepts <c>direct-tcpip</c> alongside its <c>session</c>
+    /// handler — without changing how the connection is constructed.
+    /// </summary>
+    /// <param name="channelType">The channel type to handle.</param>
+    /// <param name="handler">The handler.</param>
+    /// <exception cref="ArgumentException">The channel type is null or empty.</exception>
+    /// <exception cref="ArgumentNullException">The handler is null.</exception>
+    public void RegisterChannelOpenHandler(string channelType, ISshChannelOpenHandler handler)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(channelType);
+        ArgumentNullException.ThrowIfNull(handler);
+        _channelOpenHandlers[channelType] = handler;
+    }
+
+    /// <summary>
+    /// Removes a per-type channel-open handler previously registered with
+    /// <see cref="RegisterChannelOpenHandler"/>.
+    /// </summary>
+    /// <param name="channelType">The channel type to stop handling.</param>
+    /// <exception cref="ArgumentException">The channel type is null or empty.</exception>
+    public void UnregisterChannelOpenHandler(string channelType)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(channelType);
+        _channelOpenHandlers.TryRemove(channelType, out _);
+    }
+
+    /// <summary>
+    /// Registers a handler for peer-initiated global requests of the given name (for example a server
+    /// handling <c>tcpip-forward</c>). Unregistered names are answered SSH_MSG_REQUEST_FAILURE.
+    /// </summary>
+    /// <param name="requestName">The global request name to handle.</param>
+    /// <param name="handler">The handler.</param>
+    /// <exception cref="ArgumentException">The request name is null or empty.</exception>
+    /// <exception cref="ArgumentNullException">The handler is null.</exception>
+    public void RegisterGlobalRequestHandler(string requestName, ISshGlobalRequestHandler handler)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(requestName);
+        ArgumentNullException.ThrowIfNull(handler);
+        _globalRequestHandlers[requestName] = handler;
+    }
+
+    /// <summary>
+    /// Removes a global-request handler previously registered with
+    /// <see cref="RegisterGlobalRequestHandler"/>.
+    /// </summary>
+    /// <param name="requestName">The global request name to stop handling.</param>
+    /// <exception cref="ArgumentException">The request name is null or empty.</exception>
+    public void UnregisterGlobalRequestHandler(string requestName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(requestName);
+        _globalRequestHandlers.TryRemove(requestName, out _);
+    }
 
     /// <summary>
     /// Opens a <c>session</c> channel and wraps it for interactive/command use.
@@ -151,28 +209,51 @@ public sealed class SshConnection : IAsyncDisposable
     public async ValueTask<bool> SendGlobalRequestAsync(string requestName, bool wantReply, ReadOnlyMemory<byte> requestData, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(requestName);
-        TaskCompletionSource<bool>? reply = null;
-        if (wantReply)
+        if (!wantReply)
         {
-            reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _pendingGlobalRequests.Enqueue(reply);
+            await SendGlobalRequestNoReplyAsync(requestName, requestData, cancellationToken).ConfigureAwait(false);
+            return true;
         }
+        SshGlobalRequestReply reply = await SendGlobalRequestWithReplyAsync(requestName, requestData, cancellationToken).ConfigureAwait(false);
+        return reply.Success;
+    }
 
+    /// <summary>
+    /// Sends a global (connection-level) request that wants a reply (RFC 4254 §4) and returns the outcome
+    /// including the request-specific reply bytes — for example the bound port a <c>tcpip-forward</c> with
+    /// port 0 returns in SSH_MSG_REQUEST_SUCCESS.
+    /// </summary>
+    /// <param name="requestName">The request name.</param>
+    /// <param name="requestData">The request-specific bytes.</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    /// <returns>The reply (success flag plus any reply bytes).</returns>
+    /// <exception cref="ArgumentNullException">The request name is null.</exception>
+    public async ValueTask<SshGlobalRequestReply> SendGlobalRequestWithReplyAsync(string requestName, ReadOnlyMemory<byte> requestData, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(requestName);
+        TaskCompletionSource<SshGlobalRequestReply> reply = new TaskCompletionSource<SshGlobalRequestReply>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingGlobalRequests.Enqueue(reply);
         using (PooledBufferWriter writer = new PooledBufferWriter(16 + requestData.Length))
         {
             SshWireWriter wire = new SshWireWriter(writer);
             wire.WriteByte((byte)SshMessageNumber.GlobalRequest);
             wire.WriteText(requestName);
-            wire.WriteBoolean(wantReply);
+            wire.WriteBoolean(true);
             wire.WriteRaw(requestData.Span);
             await SendAsync(writer.WrittenMemory, cancellationToken).ConfigureAwait(false);
         }
-
-        if (reply == null)
-        {
-            return true;
-        }
         return await reply.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask SendGlobalRequestNoReplyAsync(string requestName, ReadOnlyMemory<byte> requestData, CancellationToken cancellationToken)
+    {
+        using PooledBufferWriter writer = new PooledBufferWriter(16 + requestData.Length);
+        SshWireWriter wire = new SshWireWriter(writer);
+        wire.WriteByte((byte)SshMessageNumber.GlobalRequest);
+        wire.WriteText(requestName);
+        wire.WriteBoolean(false);
+        wire.WriteRaw(requestData.Span);
+        await SendAsync(writer.WrittenMemory, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -295,13 +376,13 @@ public sealed class SshConnection : IAsyncDisposable
             case SshMessageNumber.NewKeys:
                 throw new SshConnectionException("Received SSH_MSG_NEWKEYS outside a key exchange.");
             case SshMessageNumber.GlobalRequest:
-                HandleGlobalRequest(packet.Body);
+                await HandleGlobalRequestAsync(packet.Body.ToArray(), cancellationToken).ConfigureAwait(false);
                 break;
             case SshMessageNumber.RequestSuccess:
-                CompleteGlobalRequest(true);
+                CompleteGlobalRequest(true, packet.Body);
                 break;
             case SshMessageNumber.RequestFailure:
-                CompleteGlobalRequest(false);
+                CompleteGlobalRequest(false, ReadOnlySpan<byte>.Empty);
                 break;
             case SshMessageNumber.ChannelOpen:
                 await HandleChannelOpenAsync(ParseChannelOpen(packet.Body), cancellationToken).ConfigureAwait(false);
@@ -360,11 +441,18 @@ public sealed class SshConnection : IAsyncDisposable
     {
         ChannelOpenReceived?.Invoke(this, new SshChannelOpenEventArgs(open.ChannelType, open.SenderChannel, open.InitialWindow, open.MaximumPacket));
 
-        if (_channelOpenHandler != null)
+        // A handler registered for the specific channel type takes priority over the constructor fallback
+        // (which the server uses for `session`); this lets both roles accept forwarding channels.
+        if (!_channelOpenHandlers.TryGetValue(open.ChannelType, out ISshChannelOpenHandler? handler))
+        {
+            handler = _channelOpenHandler;
+        }
+
+        if (handler != null)
         {
             SshChannelOpenRequestContext context = new SshChannelOpenRequestContext(
                 this, open.ChannelType, open.TypeSpecificData, open.SenderChannel, open.InitialWindow, open.MaximumPacket);
-            await _channelOpenHandler.HandleOpenAsync(context, cancellationToken).ConfigureAwait(false);
+            await handler.HandleOpenAsync(context, cancellationToken).ConfigureAwait(false);
             if (!context.Resolved)
             {
                 RejectInboundChannel(open.SenderChannel, SshChannelOpenFailureReason.UnknownChannelType, "Channel type not handled.");
@@ -529,23 +617,55 @@ public sealed class SshConnection : IAsyncDisposable
         }
     }
 
-    private void HandleGlobalRequest(ReadOnlySpan<byte> body)
+    private async ValueTask HandleGlobalRequestAsync(byte[] body, CancellationToken cancellationToken)
     {
+        string requestName;
+        bool wantReply;
+        ReadOnlyMemory<byte> requestData;
         SshWireReader reader = new SshWireReader(body);
-        reader.ReadText();
-        bool wantReply = reader.ReadBoolean();
+        requestName = reader.ReadText();
+        wantReply = reader.ReadBoolean();
+        requestData = reader.Remaining > 0
+            ? new ReadOnlyMemory<byte>(body, body.Length - reader.Remaining, reader.Remaining)
+            : ReadOnlyMemory<byte>.Empty;
+
+        if (_globalRequestHandlers.TryGetValue(requestName, out ISshGlobalRequestHandler? handler))
+        {
+            SshGlobalRequestContext context = new SshGlobalRequestContext(this, requestName, requestData, wantReply);
+            await handler.HandleRequestAsync(context, cancellationToken).ConfigureAwait(false);
+            if (!context.Resolved && wantReply)
+            {
+                PostGlobalRequestFailure();
+            }
+            return;
+        }
+
         if (wantReply)
         {
-            PostSend(new byte[] { (byte)SshMessageNumber.RequestFailure });
+            PostGlobalRequestFailure();
         }
     }
 
-    private void CompleteGlobalRequest(bool success)
+    private void CompleteGlobalRequest(bool success, ReadOnlySpan<byte> data)
     {
-        if (_pendingGlobalRequests.TryDequeue(out TaskCompletionSource<bool>? reply))
+        if (_pendingGlobalRequests.TryDequeue(out TaskCompletionSource<SshGlobalRequestReply>? reply))
         {
-            reply.TrySetResult(success);
+            reply.TrySetResult(new SshGlobalRequestReply(success, success ? data.ToArray() : Array.Empty<byte>()));
         }
+    }
+
+    internal void PostGlobalRequestSuccess(ReadOnlySpan<byte> data)
+    {
+        using PooledBufferWriter writer = new PooledBufferWriter(1 + data.Length);
+        SshWireWriter wire = new SshWireWriter(writer);
+        wire.WriteByte((byte)SshMessageNumber.RequestSuccess);
+        wire.WriteRaw(data);
+        PostSend(writer.WrittenSpan.ToArray());
+    }
+
+    internal void PostGlobalRequestFailure()
+    {
+        PostSend(new byte[] { (byte)SshMessageNumber.RequestFailure });
     }
 
     private async ValueTask TriggerRekeyIfDueAsync(CancellationToken cancellationToken)
@@ -635,7 +755,7 @@ public sealed class SshConnection : IAsyncDisposable
         {
             channel.Fault(exception);
         }
-        while (_pendingGlobalRequests.TryDequeue(out TaskCompletionSource<bool>? reply))
+        while (_pendingGlobalRequests.TryDequeue(out TaskCompletionSource<SshGlobalRequestReply>? reply))
         {
             reply.TrySetException(exception);
         }
