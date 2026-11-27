@@ -1,0 +1,147 @@
+# Publishes this repository's README.md as its GitHub Pages site (BryanApellanes/threeheadz-tracker#38).
+# The root README.md becomes the index page; the repository's other Markdown files are published next to it, so
+# relative links between docs keep working. Submodules are not checked out.
+name: pages
+
+on:
+  push:
+    branches: [ "bam_ssh" ]
+    paths:
+      - "**.md"
+      - "**.markdown"
+      - "**.png"
+      - "**.jpg"
+      - "**.jpeg"
+      - "**.gif"
+      - "**.svg"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    branches: [ "bam_ssh" ]
+    paths:
+      - "**.md"
+      - "**.markdown"
+      - "**.png"
+      - "**.jpg"
+      - "**.jpeg"
+      - "**.gif"
+      - "**.svg"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # jekyll-build-pages reads this repo's Pages settings to set the site's base URL (/<repo>/)
+      pages: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Gather the Markdown
+        env:
+          SITE: ${{ github.workspace }}/.pages-site
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$SITE"
+          # Tracked regular files only: submodule contents are not in this checkout, and a symlink is skipped
+          # rather than followed.
+          git ls-files -s -z -- ':(icase)*.md' ':(icase)*.markdown' ':(icase)*.png' ':(icase)*.jpg' \
+              ':(icase)*.jpeg' ':(icase)*.gif' ':(icase)*.svg' \
+            | while IFS= read -r -d '' entry; do
+                mode=${entry%% *}; path=${entry#*$'\t'}
+                case "$mode" in 100644|100755) ;; *) continue ;; esac
+                mkdir -p "$SITE/$(dirname -- "$path")"
+                cp -- "$path" "$SITE/$path"
+              done
+          find "$SITE" -type f \( -iname '*.md' -o -iname '*.markdown' \) -print0 | while IFS= read -r -d '' f; do
+            # A leading UTF-8 BOM would otherwise end up in front of the first heading.
+            sed -i '1s/^\xEF\xBB\xBF//' "$f"
+            # Pages with Liquid-like text ({{ or {%), such as Handlebars templates, are wrapped in raw tags so
+            # it is shown as written. Other pages are left alone. A page that itself contains an endraw tag
+            # closes the wrapper early and fails the build.
+            grep -qE '\{\{|\{%' "$f" || continue
+            awk -f - "$f" > "$f.tmp" <<'AWK'
+          function trim(s) { sub(/[ \t\r]+$/, "", s); return s }
+          function yq(s) { gsub(/'/, "''", s); return "'" s "'" }
+          { line[NR] = $0 }
+          END {
+            close_at = 0
+            if (NR > 0 && trim(line[1]) == "---")
+              for (i = 2; i <= NR; i++) { t = trim(line[i]); if (t == "---" || t == "...") { close_at = i; break } }
+            start = close_at + 1
+            title = ""; has_title = 0
+            for (i = 2; i < close_at; i++) if (line[i] ~ /^title[ \t]*:/) has_title = 1
+            for (i = start; i <= NR; i++) {
+              t = trim(line[i]); if (t == "") continue
+              if (t ~ /^#+[ \t]/) { title = t; sub(/^#+[ \t]+/, "", title); sub(/[ \t]+#+$/, "", title) }
+              break
+            }
+            if (close_at) {
+              for (i = 1; i < close_at; i++) print line[i]
+              if (!has_title && title != "") print "title: " yq(title)
+              print line[close_at]
+            } else if (title != "") {
+              print "---"; print "title: " yq(title); print "---"
+            }
+            print "{% raw %}"
+            for (i = start; i <= NR; i++) print line[i]
+            print "{% endraw %}"
+          }
+          AWK
+            mv "$f.tmp" "$f"
+          done
+          # The site title is the root README's opening heading (the one its page title is taken from), so the
+          # index page does not repeat it; failing that, the repository name.
+          title=""
+          if [ -f "$SITE/README.md" ]; then
+            title=$(awk 'NR == 1 && /^---[ \t\r]*$/ { fm = 1; next }
+                         fm { if ($0 ~ /^(---|\.\.\.)[ \t\r]*$/) fm = 0; next }
+                         /^[ \t\r]*$/ || /^\{% raw %\}[\r]?$/ { next }
+                         /^#+[ \t]/ { sub(/^#+[ \t]+/, ""); sub(/[ \t\r]+#*[ \t\r]*$/, ""); sub(/\r$/, ""); print }
+                         { exit }' "$SITE/README.md")
+          fi
+          [ -n "$title" ] || title=$REPO_NAME
+          printf "title: '%s'\nrepository: %s\n" "${title//\'/\'\'}" "$REPO_FULL_NAME" > "$SITE/_config.yml"
+
+      - name: Build
+        uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697 # v1.0.13
+        with:
+          source: ./.pages-site
+          destination: ./_site
+
+      # Also on pull requests, so the built pages can be downloaded and checked before merge. Nothing deploys
+      # from a pull request.
+      - name: Upload
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+
+  deploy:
+    # Only the real branch deploys. The github-pages environment's branch policy enforces the same rule.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/bam_ssh'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
